@@ -1,4 +1,4 @@
-require("dotenv").config();
+// require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const bcrypt = require("bcrypt");
@@ -98,7 +98,7 @@ app.post("/api/register", async (req, res) => {
       .single();
     if (error) return res.status(400).json({ error: error.message });
 
-    // create blank profile row
+    // create blank profile row (so joins always have something)
     await supabase.from("profiles").upsert({ user_id: data.id });
 
     res.status(201).json({ message: "User registered", user: { id: data.id, username: data.username } });
@@ -139,17 +139,40 @@ app.get("/api/users", async (req, res) => {
   res.json({ id: user.id, username: user.username });
 });
 
-// Search users by username
+// Search users by username (with profile preview)
 app.get("/api/users/search", async (req, res) => {
-  const { q = "", limit = 10 } = req.query;
-  if (!q) return res.json([]);
-  const { data, error } = await supabase
-    .from("users")
-    .select("id, username")
-    .ilike("username", `%${q}%`)
-    .limit(Number(limit));
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
+  try {
+    const { q = "", limit = 10 } = req.query;
+    if (!q) return res.json([]);
+
+    const { data: users, error: uErr } = await supabase
+      .from("users")
+      .select("id, username")
+      .ilike("username", `%${q}%`)
+      .limit(Number(limit));
+
+    if (uErr) return res.status(500).json({ error: uErr.message });
+    if (!users?.length) return res.json([]);
+
+    const ids = users.map((u) => u.id);
+    const { data: profs, error: pErr } = await supabase
+      .from("profiles")
+      .select("user_id, display_name, avatar_url")
+      .in("user_id", ids);
+
+    if (pErr) return res.status(500).json({ error: pErr.message });
+
+    const map = Object.fromEntries((profs || []).map((p) => [p.user_id, p]));
+    const out = users.map((u) => ({
+      id: u.id,
+      username: u.username,
+      display_name: map[u.id]?.display_name || null,
+      avatar_url: map[u.id]?.avatar_url || null,
+    }));
+    res.json(out);
+  } catch {
+    res.status(500).json({ error: "search failed" });
+  }
 });
 
 // ===================================================
@@ -167,6 +190,7 @@ app.get("/api/profile/:username", async (req, res) => {
     .select("display_name, bio, avatar_url, created_at, updated_at")
     .eq("user_id", user.id)
     .single();
+  // If no row: code PGRST116; just return nulls
   if (error && error.code !== "PGRST116") return res.status(500).json({ error: error.message });
 
   res.json({
@@ -175,15 +199,41 @@ app.get("/api/profile/:username", async (req, res) => {
   });
 });
 
-// Upsert my profile
-app.put("/api/profile", authenticateToken, async (req, res) => {
+// Get my profile (auth)
+app.get("/api/profile", authenticateToken, async (req, res) => {
+  const { data: profile, error } = await supabase
+    .from("profiles")
+    .select("display_name, bio, avatar_url, created_at, updated_at")
+    .eq("user_id", req.user.id)
+    .maybeSingle();
+
+  if (error && error.code !== "PGRST116") return res.status(500).json({ error: error.message });
+
+  res.json({
+    username: req.user.username,
+    profile: profile || { display_name: null, bio: null, avatar_url: null },
+  });
+});
+
+// Shared profile upsert handler
+async function upsertMyProfileHandler(req, res) {
   const { display_name = null, bio = null, avatar_url = null } = req.body || {};
   const { error } = await supabase
     .from("profiles")
-    .upsert({ user_id: req.user.id, display_name, bio, avatar_url, updated_at: new Date().toISOString() });
+    .upsert({
+      user_id: req.user.id,
+      display_name,
+      bio,
+      avatar_url,
+      updated_at: new Date().toISOString(),
+    });
   if (error) return res.status(400).json({ error: error.message });
-  res.json({ message: "Profile updated" });
-});
+  res.json({ message: "Profile saved" });
+}
+
+// Upsert my profile (supports BOTH PUT and POST)
+app.put("/api/profile", authenticateToken, upsertMyProfileHandler);
+app.post("/api/profile", authenticateToken, upsertMyProfileHandler);
 
 // ===================================================
 //                      TONES
@@ -434,7 +484,9 @@ app.get("/api/messages", async (req, res) => {
     if (visibility === "public") {
       const { data, error } = await supabase
         .from("messages")
-        .select("id, username, text, tone, is_anonymous, visibility, group_id, recipient_user_id, original_text, media_url, media_type, inserted_at")
+        .select(
+          "id, username, text, tone, is_anonymous, visibility, group_id, recipient_user_id, original_text, media_url, media_type, inserted_at"
+        )
         .eq("visibility", "public")
         .order("inserted_at", { ascending: false });
       if (error) return res.status(500).json({ error: error.message });
@@ -442,11 +494,16 @@ app.get("/api/messages", async (req, res) => {
       return res.json(masked);
     }
 
+    // Private feeds require auth
     const token = getAuthToken(req);
     if (!token) return res.status(401).json({ error: "No token" });
 
     let me;
-    try { me = jwt.verify(token, SECRET); } catch { return res.status(403).json({ error: "Invalid token" }); }
+    try {
+      me = jwt.verify(token, SECRET);
+    } catch {
+      return res.status(403).json({ error: "Invalid token" });
+    }
 
     if (visibility === "group") {
       if (!group_id) return res.status(400).json({ error: "group_id is required for group messages" });
@@ -455,7 +512,9 @@ app.get("/api/messages", async (req, res) => {
 
       const { data, error } = await supabase
         .from("messages")
-        .select("id, username, text, tone, is_anonymous, visibility, group_id, recipient_user_id, original_text, media_url, media_type, inserted_at")
+        .select(
+          "id, username, text, tone, is_anonymous, visibility, group_id, recipient_user_id, original_text, media_url, media_type, inserted_at"
+        )
         .eq("visibility", "group")
         .eq("group_id", group_id)
         .order("inserted_at", { ascending: false });
@@ -471,11 +530,14 @@ app.get("/api/messages", async (req, res) => {
       const otherUser = await getUserById(Number(recipient_user_id));
       if (!meUser || !otherUser) return res.status(400).json({ error: "invalid user(s)" });
 
+      // show both directions of the DM
       const orClause = `and(recipient_user_id.eq.${recipient_user_id},username.eq.${meUser.username}),and(recipient_user_id.eq.${me.id},username.eq.${otherUser.username})`;
 
       const { data, error } = await supabase
         .from("messages")
-        .select("id, username, text, tone, is_anonymous, visibility, group_id, recipient_user_id, original_text, media_url, media_type, inserted_at")
+        .select(
+          "id, username, text, tone, is_anonymous, visibility, group_id, recipient_user_id, original_text, media_url, media_type, inserted_at"
+        )
         .eq("visibility", "dm")
         .or(orClause)
         .order("inserted_at", { ascending: false });
