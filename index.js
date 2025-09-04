@@ -1,6 +1,3 @@
-// index.js — ReMemory (Groups v1)
-// CommonJS style to match your current project
-
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
@@ -9,92 +6,104 @@ const jwt = require("jsonwebtoken");
 const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
-
-/* =========================
-   Basic Config
-========================= */
-const PORT = process.env.PORT || 3000;
-const SECRET = process.env.SECRET || "regret-toast";
-const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
-
 app.use(express.json());
-app.use(
-  cors({
-    origin: CORS_ORIGIN,
-    credentials: false,
-  })
-);
+app.use(cors());
 
-// Supabase client
+// --- Supabase & JWT ---
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+const SECRET = process.env.SECRET || "regret-toast";
 
-/* =========================
-   Helpers / Auth
-========================= */
-function authenticateToken(req, res, next) {
-  const authHeader = req.headers["authorization"] || "";
-  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
-  if (!token) return res.status(401).json({ error: "No token" });
-
-  try {
-    const user = jwt.verify(token, SECRET);
-    req.user = user; // { username }
-    next();
-  } catch (err) {
-    return res.status(403).json({ error: "Invalid token" });
-  }
+// ---------- Helpers ----------
+function signToken(payload) {
+  return jwt.sign(payload, SECRET, { expiresIn: "12h" });
 }
-
-// lookup the current user's DB row by username
-async function getUserByUsername(username) {
+function getAuthToken(req) {
+  const authHeader = req.headers["authorization"];
+  return authHeader && authHeader.split(" ")[1];
+}
+async function getUserByUsername(username, withHash = false) {
+  const columns = withHash ? "id, username, password_hash" : "id, username";
+  const { data, error } = await supabase
+    .from("users")
+    .select(columns)
+    .eq("username", username)
+    .single();
+  if (error) return null;
+  return data;
+}
+async function getUserById(id) {
   const { data, error } = await supabase
     .from("users")
     .select("id, username")
-    .eq("username", username)
+    .eq("id", id)
     .single();
-  if (error || !data) return null;
-  return data; // { id, username }
+  if (error) return null;
+  return data;
 }
-
-// ensure tone exists
-async function assertToneExists(toneName) {
+async function isGroupMember(groupId, userId) {
   const { data, error } = await supabase
-    .from("tones")
-    .select("name")
-    .eq("name", toneName)
+    .from("group_members")
+    .select("user_id, role")
+    .eq("group_id", groupId)
+    .eq("user_id", userId)
     .single();
-  if (error || !data) return false;
-  return true;
+  if (error) return null;
+  return data; // { user_id, role }
+}
+async function hasGroupRole(groupId, userId, roles = ["owner", "admin"]) {
+  const m = await isGroupMember(groupId, userId);
+  if (!m) return false;
+  return roles.includes(m.role);
 }
 
-/* =========================
-   Health
-========================= */
+// ---------- Auth middleware ----------
+async function authenticateToken(req, res, next) {
+  const token = getAuthToken(req);
+  if (!token) return res.status(401).json({ error: "No token" });
+
+  jwt.verify(token, SECRET, async (err, payload) => {
+    if (err) return res.status(403).json({ error: "Invalid token" });
+    req.user = { id: payload.id, username: payload.username };
+    if (!req.user.id || !req.user.username) {
+      const dbUser = await getUserByUsername(payload.username);
+      if (!dbUser) return res.status(401).json({ error: "User not found" });
+      req.user = { id: dbUser.id, username: dbUser.username };
+    }
+    next();
+  });
+}
+
+// ===================================================
+//               BASIC & AUTH ROUTES
+// ===================================================
+
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true, service: "regret-backend", time: new Date().toISOString() });
 });
 
-/* =========================
-   Auth
-========================= */
-// Register
+// Register (unique usernames)
 app.post("/api/register", async (req, res) => {
   try {
-    const { username, password } = req.body || {};
-    if (!username || !password) {
-      return res.status(400).json({ error: "username and password are required" });
-    }
+    let { username, password } = req.body || {};
+    if (!username || !password) return res.status(400).json({ error: "username and password required" });
+
+    const exists = await getUserByUsername(username);
+    if (exists) return res.status(409).json({ error: "username already exists" });
 
     const password_hash = await bcrypt.hash(password, 10);
     const { data, error } = await supabase
       .from("users")
       .insert([{ username, password_hash }])
-      .select();
-
+      .select()
+      .single();
     if (error) return res.status(400).json({ error: error.message });
-    res.status(201).json({ message: "User registered", user: data[0] });
-  } catch (err) {
-    res.status(500).json({ error: "Server error: " + err.message });
+
+    // create blank profile row
+    await supabase.from("profiles").upsert({ user_id: data.id });
+
+    res.status(201).json({ message: "User registered", user: { id: data.id, username: data.username } });
+  } catch (e) {
+    res.status(500).json({ error: "Registration failed" });
   }
 });
 
@@ -102,303 +111,387 @@ app.post("/api/register", async (req, res) => {
 app.post("/api/login", async (req, res) => {
   try {
     const { username, password } = req.body || {};
-    if (!username || !password) {
-      return res.status(400).json({ error: "username and password are required" });
-    }
+    if (!username || !password) return res.status(400).json({ error: "username and password required" });
 
-    const { data, error } = await supabase
-      .from("users")
-      .select("*")
-      .eq("username", username)
-      .single();
+    const user = await getUserByUsername(username, true);
+    if (!user) return res.status(401).json({ error: "Invalid credentials" });
 
-    if (error || !data) return res.status(401).json({ error: "Invalid credentials" });
+    const ok = await bcrypt.compare(password, user.password_hash);
+    if (!ok) return res.status(401).json({ error: "Wrong password" });
 
-    const valid = await bcrypt.compare(password, data.password_hash);
-    if (!valid) return res.status(401).json({ error: "Wrong password" });
-
-    const token = jwt.sign({ username }, SECRET, { expiresIn: "12h" });
+    const token = signToken({ id: user.id, username: user.username });
     res.json({ message: "Login successful", token });
-  } catch (err) {
-    res.status(500).json({ error: "Server error: " + err.message });
+  } catch {
+    res.status(500).json({ error: "Login failed" });
   }
 });
 
-/* =========================
-   Tones
-========================= */
-// List tones
+// ===================================================
+//                      USERS
+// ===================================================
+
+// Get id by username
+app.get("/api/users", async (req, res) => {
+  const { username } = req.query;
+  if (!username) return res.status(400).json({ error: "username is required" });
+  const user = await getUserByUsername(username);
+  if (!user) return res.status(404).json({ error: "user not found" });
+  res.json({ id: user.id, username: user.username });
+});
+
+// Search users by username
+app.get("/api/users/search", async (req, res) => {
+  const { q = "", limit = 10 } = req.query;
+  if (!q) return res.json([]);
+  const { data, error } = await supabase
+    .from("users")
+    .select("id, username")
+    .ilike("username", `%${q}%`)
+    .limit(Number(limit));
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+// ===================================================
+//                    PROFILES
+// ===================================================
+
+// Get a public profile by username
+app.get("/api/profile/:username", async (req, res) => {
+  const { username } = req.params;
+  const user = await getUserByUsername(username);
+  if (!user) return res.status(404).json({ error: "user not found" });
+
+  const { data: profile, error } = await supabase
+    .from("profiles")
+    .select("display_name, bio, avatar_url, created_at, updated_at")
+    .eq("user_id", user.id)
+    .single();
+  if (error && error.code !== "PGRST116") return res.status(500).json({ error: error.message });
+
+  res.json({
+    username: user.username,
+    profile: profile || { display_name: null, bio: null, avatar_url: null },
+  });
+});
+
+// Upsert my profile
+app.put("/api/profile", authenticateToken, async (req, res) => {
+  const { display_name = null, bio = null, avatar_url = null } = req.body || {};
+  const { error } = await supabase
+    .from("profiles")
+    .upsert({ user_id: req.user.id, display_name, bio, avatar_url, updated_at: new Date().toISOString() });
+  if (error) return res.status(400).json({ error: error.message });
+  res.json({ message: "Profile updated" });
+});
+
+// ===================================================
+//                      TONES
+// ===================================================
+
 app.get("/api/tones", async (_req, res) => {
-  try {
-    const { data, error } = await supabase
-      .from("tones")
-      .select("name, category")
-      .order("name", { ascending: true });
+  const { data, error } = await supabase
+    .from("tones")
+    .select("name, category")
+    .order("name", { ascending: true });
 
-    if (error) return res.status(500).json({ error: error.message });
-    res.json(data || []);
-  } catch (err) {
-    res.status(500).json({ error: "Server error: " + err.message });
-  }
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
 });
 
-// Create tone (for now: any authenticated user; we’ll gate to admins later)
-app.post("/api/tones", authenticateToken, async (req, res) => {
-  try {
-    const { name, category } = req.body || {};
-    const n = (name || "").trim();
-    const c = (category || "").trim();
+// ===================================================
+//                      GROUPS
+// ===================================================
 
-    if (!n || n.length < 2 || n.length > 50) {
-      return res.status(400).json({ error: "Tone name 2–50 chars required" });
-    }
-    if (!["personal", "professional", "party"].includes(c)) {
-      return res.status(400).json({ error: "Invalid category" });
-    }
-
-    const { data, error } = await supabase
-      .from("tones")
-      .insert({ name: n, category: c })
-      .select("name, category")
-      .single();
-
-    if (error) return res.status(400).json({ error: error.message });
-    res.json({ message: "Tone created", tone: data });
-  } catch (err) {
-    res.status(500).json({ error: "Server error: " + err.message });
-  }
-});
-
-/* =========================
-   Groups v1
-========================= */
-// Create a group
+// Create group
 app.post("/api/groups", authenticateToken, async (req, res) => {
   try {
-    const { name, visibility } = req.body || {};
-    const n = (name || "").trim();
-    const v = (visibility || "private").trim();
-    if (!n || n.length < 2 || n.length > 100) {
-      return res.status(400).json({ error: "Name must be 2–100 chars" });
-    }
-    if (!["public", "private", "workspace"].includes(v)) {
-      return res.status(400).json({ error: "Invalid visibility" });
-    }
+    const { name, visibility = "private" } = req.body || {};
+    if (!name) return res.status(400).json({ error: "name is required" });
 
-    const me = await getUserByUsername(req.user.username);
-    if (!me) return res.status(401).json({ error: "User not found" });
-
-    const { data: group, error: gErr } = await supabase
+    const { data, error } = await supabase
       .from("groups")
-      .insert({ name: n, visibility: v, created_by: me.id })
-      .select("*")
+      .insert([{ name, visibility, created_by: req.user.id }])
+      .select()
       .single();
-    if (gErr) return res.status(400).json({ error: gErr.message });
+    if (error) return res.status(400).json({ error: error.message });
 
-    // add creator as owner
-    const { error: mErr } = await supabase
-      .from("group_members")
-      .insert({ group_id: group.id, user_id: me.id, role: "owner" });
-    if (mErr) return res.status(400).json({ error: mErr.message });
-
-    res.json({ message: "Group created", group });
-  } catch (err) {
-    res.status(500).json({ error: "Server error: " + err.message });
+    await supabase.from("group_members").insert([{ group_id: data.id, user_id: req.user.id, role: "owner" }]);
+    res.json({ message: "Group created", group: data });
+  } catch {
+    res.status(500).json({ error: "Failed to create group" });
   }
 });
 
 // List my groups
 app.get("/api/groups", authenticateToken, async (req, res) => {
   try {
-    const me = await getUserByUsername(req.user.username);
-    if (!me) return res.status(401).json({ error: "User not found" });
-
-    const { data, error } = await supabase
+    const { data: memberships, error: mErr } = await supabase
       .from("group_members")
-      .select("role, groups!inner(id, name, visibility, created_at)")
-      .eq("user_id", me.id);
-    if (error) return res.status(400).json({ error: error.message });
+      .select("group_id, role")
+      .eq("user_id", req.user.id);
+    if (mErr) return res.status(500).json({ error: mErr.message });
 
-    const groups = (data || []).map((row) => ({
-      id: row.groups.id,
-      name: row.groups.name,
-      visibility: row.groups.visibility,
-      created_at: row.groups.created_at,
-      role: row.role,
+    const ids = memberships.map((m) => m.group_id);
+    if (ids.length === 0) return res.json([]);
+
+    const { data: groups, error: gErr } = await supabase
+      .from("groups")
+      .select("id, name, visibility, created_at")
+      .in("id", ids)
+      .order("created_at", { ascending: false });
+    if (gErr) return res.status(500).json({ error: gErr.message });
+
+    const withRole = groups.map((g) => ({
+      ...g,
+      role: memberships.find((m) => m.group_id === g.id)?.role || "member",
     }));
-    res.json(groups);
-  } catch (err) {
-    res.status(500).json({ error: "Server error: " + err.message });
+    res.json(withRole);
+  } catch {
+    res.status(500).json({ error: "Failed to fetch groups" });
   }
 });
 
-// Invite a user to a group (owner/admin only)
-app.post("/api/groups/:groupId/invite", authenticateToken, async (req, res) => {
+// --- Invites ---
+
+// Create invite (owner/admin only) by username
+app.post("/api/groups/:groupId/invites", authenticateToken, async (req, res) => {
   try {
     const { groupId } = req.params;
     const { username } = req.body || {};
-    const inviteeName = (username || "").trim();
+    if (!username) return res.status(400).json({ error: "username is required" });
 
-    if (!inviteeName) return res.status(400).json({ error: "username required" });
+    const admin = await hasGroupRole(groupId, req.user.id, ["owner", "admin"]);
+    if (!admin) return res.status(403).json({ error: "Only owners/admins can invite" });
 
-    const me = await getUserByUsername(req.user.username);
-    if (!me) return res.status(401).json({ error: "User not found" });
+    const target = await getUserByUsername(username);
+    if (!target) return res.status(400).json({ error: "user not found" });
 
-    const { data: myMembership, error: memErr } = await supabase
-      .from("group_members")
-      .select("role")
+    const already = await isGroupMember(groupId, target.id);
+    if (already) return res.status(409).json({ error: "User is already a member" });
+
+    const { data: pend, error: pErr } = await supabase
+      .from("group_invites")
+      .select("id")
       .eq("group_id", groupId)
-      .eq("user_id", me.id)
+      .eq("invited_user_id", target.id)
+      .eq("status", "pending")
+      .maybeSingle();
+    if (pErr) return res.status(500).json({ error: pErr.message });
+    if (pend) return res.status(409).json({ error: "Invite already pending" });
+
+    const { data, error } = await supabase
+      .from("group_invites")
+      .insert([{ group_id: groupId, inviter_user_id: req.user.id, invited_user_id: target.id }])
+      .select()
       .single();
-    if (memErr || !myMembership) {
-      return res.status(403).json({ error: "Not a member of this group" });
-    }
-    if (!["owner", "admin"].includes(myMembership.role)) {
-      return res.status(403).json({ error: "Only owner/admin can invite" });
-    }
+    if (error) return res.status(400).json({ error: error.message });
 
-    const invitee = await getUserByUsername(inviteeName);
-    if (!invitee) return res.status(404).json({ error: "Invitee not found" });
-
-    // add as member (ignore if already member)
-    const { error: addErr } = await supabase
-      .from("group_members")
-      .insert({ group_id: groupId, user_id: invitee.id, role: "member" });
-    if (addErr && !/duplicate key/i.test(addErr.message)) {
-      return res.status(400).json({ error: addErr.message });
-    }
-
-    res.json({ message: "User invited (or already a member)" });
-  } catch (err) {
-    res.status(500).json({ error: "Server error: " + err.message });
+    res.json({ message: "Invite created", invite: data });
+  } catch {
+    res.status(500).json({ error: "Failed to create invite" });
   }
 });
 
-/* =========================
-   Messages (Public / Group / DM)
-========================= */
-// Create message
+// List pending invites for me
+app.get("/api/invites", authenticateToken, async (req, res) => {
+  const { data, error } = await supabase
+    .from("group_invites")
+    .select("id, group_id, status, created_at")
+    .eq("invited_user_id", req.user.id)
+    .eq("status", "pending")
+    .order("created_at", { ascending: false });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+// Accept invite
+app.post("/api/invites/:inviteId/accept", authenticateToken, async (req, res) => {
+  const { inviteId } = req.params;
+
+  const { data: invite, error: iErr } = await supabase
+    .from("group_invites")
+    .select("id, group_id, invited_user_id, status")
+    .eq("id", inviteId)
+    .single();
+  if (iErr) return res.status(400).json({ error: "Invite not found" });
+  if (invite.invited_user_id !== req.user.id) return res.status(403).json({ error: "Not your invite" });
+  if (invite.status !== "pending") return res.status(409).json({ error: "Invite is not pending" });
+
+  const already = await isGroupMember(invite.group_id, req.user.id);
+  if (!already) {
+    const { error: mErr } = await supabase
+      .from("group_members")
+      .insert([{ group_id: invite.group_id, user_id: req.user.id, role: "member" }]);
+    if (mErr) return res.status(400).json({ error: mErr.message });
+  }
+
+  await supabase.from("group_invites").update({ status: "accepted" }).eq("id", inviteId);
+  res.json({ message: "Invite accepted" });
+});
+
+// Decline invite
+app.post("/api/invites/:inviteId/decline", authenticateToken, async (req, res) => {
+  const { inviteId } = req.params;
+  const { data: invite, error: iErr } = await supabase
+    .from("group_invites")
+    .select("id, invited_user_id, status")
+    .eq("id", inviteId)
+    .single();
+  if (iErr) return res.status(400).json({ error: "Invite not found" });
+  if (invite.invited_user_id !== req.user.id) return res.status(403).json({ error: "Not your invite" });
+  if (invite.status !== "pending") return res.status(409).json({ error: "Invite is not pending" });
+
+  await supabase.from("group_invites").update({ status: "declined" }).eq("id", inviteId);
+  res.json({ message: "Invite declined" });
+});
+
+// Admin: list group invites
+app.get("/api/groups/:groupId/invites", authenticateToken, async (req, res) => {
+  const { groupId } = req.params;
+  const admin = await hasGroupRole(groupId, req.user.id, ["owner", "admin"]);
+  if (!admin) return res.status(403).json({ error: "Only owners/admins can view invites" });
+
+  const { data, error } = await supabase
+    .from("group_invites")
+    .select("id, invited_user_id, status, created_at")
+    .eq("group_id", groupId)
+    .order("created_at", { ascending: false });
+  if (error) return res.status(500).json({ error: error.message });
+
+  const ids = data.map((i) => i.invited_user_id);
+  let usersMap = {};
+  if (ids.length) {
+    const { data: users } = await supabase.from("users").select("id, username").in("id", ids);
+    usersMap = Object.fromEntries((users || []).map((u) => [u.id, u.username]));
+  }
+  res.json(data.map((i) => ({ ...i, username: usersMap[i.invited_user_id] || "unknown" })));
+});
+
+// ===================================================
+//                      MESSAGES
+// ===================================================
+
+// Create message (public|group|dm) with optional media
 app.post("/api/messages", authenticateToken, async (req, res) => {
   try {
-    const { text, original_text, tone, is_anonymous, visibility, group_id, recipient_user_id } = req.body || {};
-    const t = (tone || "").trim();
-    const vis = (visibility || "public").trim();
+    const {
+      text,
+      tone,
+      is_anonymous = false,
+      visibility = "public",
+      group_id = null,
+      recipient_user_id = null,
+      original_text = null,
+      media_url = null,
+      media_type = null,
+    } = req.body || {};
 
-    if (!text || !text.trim()) {
-      return res.status(400).json({ error: "Message text is required" });
-    }
-    if (!t) return res.status(400).json({ error: "Tone is required" });
-    if (!(await assertToneExists(t))) return res.status(400).json({ error: "Invalid tone" });
-    if (!["public", "group", "dm"].includes(vis)) {
-      return res.status(400).json({ error: "Invalid visibility" });
-    }
+    if (!text || !tone) return res.status(400).json({ error: "text and tone are required" });
+    if (!["public", "group", "dm"].includes(visibility))
+      return res.status(400).json({ error: "invalid visibility" });
+    if (media_type && !["image", "video"].includes(media_type))
+      return res.status(400).json({ error: "invalid media_type" });
 
-    const me = await getUserByUsername(req.user.username);
-    if (!me) return res.status(401).json({ error: "User not found" });
+    if (visibility === "group") {
+      if (!group_id) return res.status(400).json({ error: "group_id is required for group messages" });
+      const member = await isGroupMember(group_id, req.user.id);
+      if (!member) return res.status(403).json({ error: "Not a member of this group" });
+    }
+    if (visibility === "dm") {
+      if (!recipient_user_id)
+        return res.status(400).json({ error: "recipient_user_id is required for dm messages" });
+      const exists = await getUserById(Number(recipient_user_id));
+      if (!exists) return res.status(400).json({ error: "recipient user not found" });
+    }
 
     const payload = {
-      username: me.username, // you’re storing sender username today
-      text: text.trim(),
-      original_text: original_text ? String(original_text) : null,
-      tone: t,
-      is_anonymous: Boolean(is_anonymous),
-      visibility: vis,
-      group_id: null,
-      recipient_user_id: null,
+      username: req.user.username,
+      text,
+      tone,
+      is_anonymous: !!is_anonymous,
+      visibility,
+      group_id,
+      recipient_user_id,
+      original_text,
+      media_url,
+      media_type,
     };
-
-    if (vis === "group") {
-      if (!group_id) return res.status(400).json({ error: "group_id required for group visibility" });
-      // must be a member
-      const { data: mem, error: memErr } = await supabase
-        .from("group_members")
-        .select("role")
-        .eq("group_id", group_id)
-        .eq("user_id", me.id)
-        .single();
-      if (memErr || !mem) return res.status(403).json({ error: "Not a member of this group" });
-      payload.group_id = group_id;
-    }
-
-    if (vis === "dm") {
-      if (!recipient_user_id) {
-        return res.status(400).json({ error: "recipient_user_id required for dm visibility" });
-      }
-      if (Number(recipient_user_id) === Number(me.id)) {
-        return res.status(400).json({ error: "Cannot DM yourself" });
-      }
-      payload.recipient_user_id = recipient_user_id;
-    }
 
     const { data, error } = await supabase.from("messages").insert([payload]).select().single();
     if (error) return res.status(500).json({ error: error.message });
-
     res.status(201).json({ message: "Message saved", data });
-  } catch (err) {
-    res.status(500).json({ error: "Server error: " + err.message });
+  } catch {
+    res.status(500).json({ error: "Failed to save message" });
   }
 });
 
-// Get messages (by scope)
-app.get("/api/messages", authenticateToken, async (req, res) => {
+// Feeds
+app.get("/api/messages", async (req, res) => {
   try {
-    const vis = (req.query.visibility || "public").trim();
-    const limit = Math.min(Number(req.query.limit) || 50, 100);
-    const me = await getUserByUsername(req.user.username);
-    if (!me) return res.status(401).json({ error: "User not found" });
+    const { visibility = "public", group_id, recipient_user_id } = req.query;
 
-    let query = supabase.from("messages").select("*");
-
-    if (vis === "public") {
-      query = query.eq("visibility", "public").order("inserted_at", { ascending: false }).limit(limit);
-    } else if (vis === "group") {
-      const group_id = req.query.group_id || "";
-      if (!group_id) return res.status(400).json({ error: "group_id is required for group messages" });
-
-      // must be member
-      const { data: mem, error: memErr } = await supabase
-        .from("group_members")
-        .select("role")
-        .eq("group_id", group_id)
-        .eq("user_id", me.id)
-        .maybeSingle();
-      if (memErr || !mem) return res.status(403).json({ error: "Not a member of this group" });
-
-      query = query.eq("visibility", "group").eq("group_id", group_id)
-        .order("inserted_at", { ascending: false }).limit(limit);
-    } else if (vis === "dm") {
-      const otherId = Number(req.query.recipient_user_id || 0);
-      if (!otherId) return res.status(400).json({ error: "recipient_user_id is required for dm messages" });
-
-      // DM between me.id and otherId
-      query = query.eq("visibility", "dm")
-        .in("recipient_user_id", [me.id, otherId])
-        .order("inserted_at", { ascending: false })
-        .limit(limit);
-    } else {
-      return res.status(400).json({ error: "Invalid visibility" });
+    if (visibility === "public") {
+      const { data, error } = await supabase
+        .from("messages")
+        .select("id, username, text, tone, is_anonymous, visibility, group_id, recipient_user_id, original_text, media_url, media_type, inserted_at")
+        .eq("visibility", "public")
+        .order("inserted_at", { ascending: false });
+      if (error) return res.status(500).json({ error: error.message });
+      const masked = data.map((m) => (m.is_anonymous ? { ...m, username: "Anonymous" } : m));
+      return res.json(masked);
     }
 
-    const { data, error } = await query;
-    if (error) return res.status(500).json({ error: error.message });
+    const token = getAuthToken(req);
+    if (!token) return res.status(401).json({ error: "No token" });
 
-    // Mask public anon usernames
-    const mapped = (data || []).map((m) => {
-      if (m.visibility === "public" && m.is_anonymous) {
-        return { ...m, username: "Anonymous" };
-      }
-      return m;
-    });
+    let me;
+    try { me = jwt.verify(token, SECRET); } catch { return res.status(403).json({ error: "Invalid token" }); }
 
-    res.json(mapped);
-  } catch (err) {
-    res.status(500).json({ error: "Server error: " + err.message });
+    if (visibility === "group") {
+      if (!group_id) return res.status(400).json({ error: "group_id is required for group messages" });
+      const member = await isGroupMember(group_id, me.id);
+      if (!member) return res.status(403).json({ error: "Not a member of this group" });
+
+      const { data, error } = await supabase
+        .from("messages")
+        .select("id, username, text, tone, is_anonymous, visibility, group_id, recipient_user_id, original_text, media_url, media_type, inserted_at")
+        .eq("visibility", "group")
+        .eq("group_id", group_id)
+        .order("inserted_at", { ascending: false });
+      if (error) return res.status(500).json({ error: error.message });
+      return res.json(data);
+    }
+
+    if (visibility === "dm") {
+      if (!recipient_user_id)
+        return res.status(400).json({ error: "recipient_user_id is required for dm messages" });
+
+      const meUser = await getUserById(me.id);
+      const otherUser = await getUserById(Number(recipient_user_id));
+      if (!meUser || !otherUser) return res.status(400).json({ error: "invalid user(s)" });
+
+      const orClause = `and(recipient_user_id.eq.${recipient_user_id},username.eq.${meUser.username}),and(recipient_user_id.eq.${me.id},username.eq.${otherUser.username})`;
+
+      const { data, error } = await supabase
+        .from("messages")
+        .select("id, username, text, tone, is_anonymous, visibility, group_id, recipient_user_id, original_text, media_url, media_type, inserted_at")
+        .eq("visibility", "dm")
+        .or(orClause)
+        .order("inserted_at", { ascending: false });
+      if (error) return res.status(500).json({ error: error.message });
+      return res.json(data);
+    }
+
+    return res.status(400).json({ error: "invalid visibility" });
+  } catch {
+    res.status(500).json({ error: "Failed to fetch messages" });
   }
 });
 
-/* =========================
-   Server
-========================= */
+// ===================================================
+
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🚀 Server listening on http://localhost:${PORT}`);
+  console.log(`Server listening on http://localhost:${PORT}`);
 });
