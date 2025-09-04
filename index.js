@@ -21,16 +21,23 @@ function getAuthToken(req) {
   const authHeader = req.headers["authorization"];
   return authHeader && authHeader.split(" ")[1];
 }
+
+// 👇 REPLACE this function with the version below
 async function getUserByUsername(username, withHash = false) {
+  if (!username) return null;
   const columns = withHash ? "id, username, password_hash" : "id, username";
+
+  // exact, case-insensitive match (no wildcards)
   const { data, error } = await supabase
     .from("users")
     .select(columns)
-    .eq("username", username)
+    .ilike("username", String(username).trim())
     .single();
+
   if (error) return null;
   return data;
 }
+
 async function getUserById(id) {
   const { data, error } = await supabase
     .from("users")
@@ -57,6 +64,7 @@ async function hasGroupRole(groupId, userId, roles = ["owner", "admin"]) {
 }
 
 // ---------- Auth middleware ----------
+
 async function authenticateToken(req, res, next) {
   const token = getAuthToken(req);
   if (!token) return res.status(401).json({ error: "No token" });
@@ -550,6 +558,189 @@ app.get("/api/messages", async (req, res) => {
     res.status(500).json({ error: "Failed to fetch messages" });
   }
 });
+
+// =========================== FOLLOWS ===========================
+
+// Follow a user by username
+app.post("/api/follow/:username", authenticateToken, async (req, res) => {
+  try {
+    const { username } = req.params;
+    const target = await getUserByUsername(username);
+    if (!target) return res.status(404).json({ error: "user not found" });
+    if (target.id === req.user.id) return res.status(400).json({ error: "cannot follow yourself" });
+
+    const { error } = await supabase
+      .from("user_follows")
+      .insert([{ follower_id: req.user.id, followee_id: target.id }]);
+
+    if (error && String(error.message).toLowerCase().includes("duplicate"))
+      return res.status(409).json({ error: "already following" });
+    if (error) return res.status(400).json({ error: error.message });
+
+    res.json({ message: `Now following ${target.username}` });
+  } catch {
+    res.status(500).json({ error: "Failed to follow" });
+  }
+});
+
+// Unfollow
+app.delete("/api/follow/:username", authenticateToken, async (req, res) => {
+  try {
+    const { username } = req.params;
+    const target = await getUserByUsername(username);
+    if (!target) return res.status(404).json({ error: "user not found" });
+
+    const { error } = await supabase
+      .from("user_follows")
+      .delete()
+      .eq("follower_id", req.user.id)
+      .eq("followee_id", target.id);
+
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ message: `Unfollowed ${target.username}` });
+  } catch {
+    res.status(500).json({ error: "Failed to unfollow" });
+  }
+});
+
+// Who this user follows
+app.get("/api/following/:username", async (req, res) => {
+  try {
+    const u = await getUserByUsername(req.params.username);
+    if (!u) return res.status(404).json({ error: "user not found" });
+
+    const { data: rows, error } = await supabase
+      .from("user_follows")
+      .select("followee_id, created_at")
+      .eq("follower_id", u.id);
+    if (error) return res.status(500).json({ error: error.message });
+
+    const ids = rows.map(r => r.followee_id);
+    let users = [];
+    if (ids.length) {
+      const { data } = await supabase.from("users").select("id, username").in("id", ids);
+      users = data || [];
+    }
+    const map = Object.fromEntries(users.map(x => [x.id, x.username]));
+    res.json(rows.map(r => ({ user_id: r.followee_id, username: map[r.followee_id], followed_at: r.created_at })));
+  } catch {
+    res.status(500).json({ error: "Failed to fetch following" });
+  }
+});
+
+// Who follows this user
+app.get("/api/followers/:username", async (req, res) => {
+  try {
+    const u = await getUserByUsername(req.params.username);
+    if (!u) return res.status(404).json({ error: "user not found" });
+
+    const { data: rows, error } = await supabase
+      .from("user_follows")
+      .select("follower_id, created_at")
+      .eq("followee_id", u.id);
+    if (error) return res.status(500).json({ error: error.message });
+
+    const ids = rows.map(r => r.follower_id);
+    let users = [];
+    if (ids.length) {
+      const { data } = await supabase.from("users").select("id, username").in("id", ids);
+      users = data || [];
+    }
+    const map = Object.fromEntries(users.map(x => [x.id, x.username]));
+    res.json(rows.map(r => ({ user_id: r.follower_id, username: map[r.follower_id], followed_at: r.created_at })));
+  } catch {
+    res.status(500).json({ error: "Failed to fetch followers" });
+  }
+});
+
+// ============================ FEEDS =============================
+
+// Home feed: my posts + people I follow + groups I belong to (latest first)
+app.get("/api/feed/home", authenticateToken, async (req, res) => {
+  try {
+    const limit = Math.min(Number(req.query.limit || 20), 100);
+
+    // who I follow
+    const { data: follows, error: fErr } = await supabase
+      .from("user_follows")
+      .select("followee_id")
+      .eq("follower_id", req.user.id);
+    if (fErr) return res.status(500).json({ error: fErr.message });
+
+    // resolve usernames for me + followees
+    const idSet = new Set([req.user.id, ...follows.map(f => f.followee_id)]);
+    const { data: users } = await supabase
+      .from("users")
+      .select("id, username")
+      .in("id", Array.from(idSet));
+    const usernames = (users || []).map(u => u.username);
+
+    // my groups
+    const { data: memberships } = await supabase
+      .from("group_members")
+      .select("group_id")
+      .eq("user_id", req.user.id);
+    const groupIds = (memberships || []).map(m => m.group_id);
+
+    // fetch public posts from me + followees
+    const selects =
+      "id, username, text, tone, is_anonymous, visibility, group_id, recipient_user_id, original_text, media_url, media_type, inserted_at";
+
+    const promises = [];
+    if (usernames.length) {
+      promises.push(
+        supabase
+          .from("messages")
+          .select(selects)
+          .eq("visibility", "public")
+          .in("username", usernames)
+      );
+    }
+    if (groupIds.length) {
+      promises.push(
+        supabase
+          .from("messages")
+          .select(selects)
+          .eq("visibility", "group")
+          .in("group_id", groupIds)
+      );
+    }
+
+    const results = await Promise.all(promises);
+    const all = results.flatMap(r => (r.data || []));
+    all.sort((a, b) => new Date(b.inserted_at) - new Date(a.inserted_at));
+
+    // keep anonymity mask for public messages
+    const masked = all.map(m =>
+      m.visibility === "public" && m.is_anonymous ? { ...m, username: "Anonymous" } : m
+    );
+
+    res.json(masked.slice(0, limit));
+  } catch {
+    res.status(500).json({ error: "Failed to build home feed" });
+  }
+});
+
+// Explore feed: recent public posts
+app.get("/api/feed/explore", async (req, res) => {
+  try {
+    const limit = Math.min(Number(req.query.limit || 20), 100);
+    const { data, error } = await supabase
+      .from("messages")
+      .select("id, username, text, tone, is_anonymous, visibility, group_id, recipient_user_id, original_text, media_url, media_type, inserted_at")
+      .eq("visibility", "public")
+      .order("inserted_at", { ascending: false })
+      .limit(limit);
+    if (error) return res.status(500).json({ error: error.message });
+
+    const masked = (data || []).map(m => (m.is_anonymous ? { ...m, username: "Anonymous" } : m));
+    res.json(masked);
+  } catch {
+    res.status(500).json({ error: "Failed to fetch explore feed" });
+  }
+});
+
+
 
 // ===================================================
 
